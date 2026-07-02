@@ -40,7 +40,8 @@ void launch_linear_f32(
     int M, int N, int K, cudaStream_t stream = nullptr);
 
 // Decode GEMV: y[N] = x[K] @ W^T, W is [N,K] row-major ([out,in], GGUF-native).
-// x,W bf16. y is bf16 (launch_gemv) or fp32 (launch_gemv_f32). One warp per row.
+// x,W bf16. y is bf16 (launch_gemv) or fp32 (launch_gemv_f32). Default uses split-K
+// (S=2 warps/row, SPARKINFER_GEMVSK=0 restores one-warp-per-row).
 void launch_gemv(const void* x, const void* W, void* y, int N, int K,
                  cudaStream_t stream = nullptr);
 void launch_gemv_f32(const void* x, const void* W, float* y, int N, int K,

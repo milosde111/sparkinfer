@@ -54,6 +54,55 @@ __global__ void gemv_kernel(const __nv_bfloat16* __restrict__ x,
 template __global__ void gemv_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, int);
 template __global__ void gemv_kernel<float>(const __nv_bfloat16*, const __nv_bfloat16*, float*, int, int);
 
+// ---- split-K bf16-weight GEMV (occupancy lever for small-N decode rows) ---------
+// The one-warp-per-row gemv_kernel under-fills the GPU when N is small (router:
+// N=256 experts at bs=1 -> 256 warps). S warps cooperate per output row, each
+// striding 1/S of the K uint4 chunks, then the S partials sum in shared. Same
+// math as gemv_kernel; only the reduction order changes. SPARKINFER_GEMVSK=0
+// restores the one-warp kernel (same env as the Q4_K dp4a split-K path).
+template <typename OutT>
+__global__ void gemv_sk_kernel(const __nv_bfloat16* __restrict__ x,
+                               const __nv_bfloat16* __restrict__ W,
+                               OutT* __restrict__ y, int N, int K) {
+    constexpr int S = 2, RPB = GEMV_WPB / S;
+    extern __shared__ float s_x[];
+    __shared__ float s_part[RPB][S];
+    for (int i = threadIdx.x; i < K; i += blockDim.x) s_x[i] = __bfloat162float(x[i]);
+    __syncthreads();
+
+    const int lane = threadIdx.x & 31, warpId = threadIdx.x >> 5;
+    const int row_local = warpId / S, split = warpId % S;
+    const int n = blockIdx.x * RPB + row_local;
+    const int n4 = K / 8;
+    float acc = 0.f;
+    if (n < N) {
+        const uint4* row4 = reinterpret_cast<const uint4*>(W + (size_t)n * K);
+        for (int i = lane + split * 32; i < n4; i += S * 32) {
+            uint4 v = row4[i];
+            const __nv_bfloat162* h2 = reinterpret_cast<const __nv_bfloat162*>(&v);
+            const int base = i * 8;
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                float2 f = __bfloat1622float2(h2[j]);
+                acc += f.x * s_x[base + 2*j] + f.y * s_x[base + 2*j + 1];
+            }
+        }
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffff, acc, m);
+        if (lane == 0) s_part[row_local][split] = acc;
+    }
+    __syncthreads();
+    if (n < N && split == 0 && lane == 0) {
+        float o = 0.f;
+        #pragma unroll
+        for (int s = 0; s < S; s++) o += s_part[row_local][s];
+        gemv_write(y + n, o);
+    }
+}
+
+template __global__ void gemv_sk_kernel<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, int);
+template __global__ void gemv_sk_kernel<float>(const __nv_bfloat16*, const __nv_bfloat16*, float*, int, int);
+
 // ---- quantized on-read GEMV (W = GGUF-native Q4_K/Q6_K [N,K]) -----------------
 // Dequantizes each 256-block in registers and dots with a full-precision (fp32)
 // activation — reads the quantized weight bytes (~4x less than bf16) with NO int8
@@ -477,7 +526,23 @@ static bool gemv_mmvq() {
     return v;
 }
 
+// SPARKINFER_GEMVSK=0 -> plain one-warp-per-row GEMV (default uses split-K for occupancy:
+// S=2 warps/row fills the GPU on small-N decode rows like the router projection).
+static bool gemv_sk() {
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("SPARKINFER_GEMVSK"); v = (e && e[0] == '0') ? 0 : 1; }
+    return v;
+}
+
 void launch_gemv(const void* x, const void* W, void* y, int N, int K, cudaStream_t stream) {
+    if (gemv_sk()) {
+        constexpr int RPB = GEMV_WPB / 2;
+        dim3 grid((N + RPB - 1) / RPB);
+        gemv_sk_kernel<__nv_bfloat16><<<grid, GEMV_WPB * 32, (size_t)K * sizeof(float), stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(W),
+            reinterpret_cast<__nv_bfloat16*>(y), N, K);
+        return;
+    }
     dim3 grid((N + GEMV_WPB - 1) / GEMV_WPB);
     gemv_kernel<__nv_bfloat16><<<grid, GEMV_WPB * 32, (size_t)K * sizeof(float), stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(W),
@@ -485,6 +550,13 @@ void launch_gemv(const void* x, const void* W, void* y, int N, int K, cudaStream
 }
 
 void launch_gemv_f32(const void* x, const void* W, float* y, int N, int K, cudaStream_t stream) {
+    if (gemv_sk()) {   // split-K: S=2 warps/row — router (N=256) and other small-N fp32 GEMVs
+        constexpr int RPB = GEMV_WPB / 2;
+        dim3 grid((N + RPB - 1) / RPB);
+        gemv_sk_kernel<float><<<grid, GEMV_WPB * 32, (size_t)K * sizeof(float), stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(W), y, N, K);
+        return;
+    }
     dim3 grid((N + GEMV_WPB - 1) / GEMV_WPB);
     gemv_kernel<float><<<grid, GEMV_WPB * 32, (size_t)K * sizeof(float), stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(W), y, N, K);
@@ -519,13 +591,6 @@ void launch_gemv_q_f32(const void* x, const void* W, int wtype, float* y, int N,
 void launch_quantize_q8_1(const void* x, void* q8, float* ad, float* as, int K, cudaStream_t stream) {
     quantize_q8_1_kernel<<<1, 256, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<signed char*>(q8), ad, as, K);
-}
-// SPARKINFER_GEMVSK=0 -> plain one-warp-per-row pre-quantized GEMV (default uses split-K
-// for occupancy: S=2 warps/row fills the GPU on the small attn projections).
-static bool gemv_sk() {
-    static int v = -1;
-    if (v < 0) { const char* e = getenv("SPARKINFER_GEMVSK"); v = (e && e[0] == '0') ? 0 : 1; }
-    return v;
 }
 // Q4_K dp4a GEMV against a pre-quantized activation (no per-block re-quant). bf16/f32 out.
 void launch_gemv_q_dp4a_pq(const void* q8, const float* ad, const float* as, const void* W,
