@@ -79,9 +79,11 @@ struct Qwen35Model::Impl {
     int   *mf_ids = nullptr, *mf_counts = nullptr;
     // flash-decoding (KV-split) attention partials
     static constexpr int MAX_NSPLITS = 256;   // partials sized for this; adaptive n_splits <= this
+    static constexpr int OCC_WAVES = 3;       // target GQA-split-block waves needed to hide the KV read
     int n_splits = 32;
     bool adaptive_splits = true;              // scale n_splits with seq_len (decode graph re-captured on change)
-    int split_chunk = 256;                    // target serial KV per split (SPARKINFER_SPLIT_CHUNK)
+    int split_chunk = 64;                     // target serial KV per split (SPARKINFER_SPLIT_CHUNK)
+    int num_sms = 0;                          // device SM count; drives the occupancy-aware split floor
     float *fa_m = nullptr, *fa_l = nullptr, *fa_acc = nullptr;
     // pre-quantized Q8_1 activation (computed once per projection input, shared across Q/K/V)
     signed char* aq8 = nullptr; float *aq8_d = nullptr, *aq8_s = nullptr;
@@ -102,11 +104,16 @@ struct Qwen35Model::Impl {
 Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEngine* engine)
     : p_(new Impl()) {
     p_->cfg = cfg; p_->kv = kv; p_->engine = engine;
-    // Flash-decode KV-split count is occupancy tuning only (math is identical for any
-    // value — empty splits contribute zero), and it's baked into the decode CUDA graph
-    // at construction. 16 over-subscribes the GPU for short context (32 q_heads * 16 =
-    // 512 single-warp blocks); SPARKINFER_NSPLITS lets the scored regime be tuned/swept
-    // without a rebuild. Clamp to [1, 64]; buffers below are sized from it.
+    // Read the device SM count once — the adaptive KV-split floor (forward_token) sizes
+    // n_splits so the GQA split kernel's num_kv_heads*n_splits blocks fill THIS GPU rather
+    // than a hardcoded card. Cheap, queried a single time at construction.
+    { cudaDeviceProp prop{}; int dev = 0; cudaGetDevice(&dev);
+      if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) p_->num_sms = prop.multiProcessorCount; }
+    // Flash-decode KV-split count is occupancy tuning only (math is identical for any value
+    // — empty splits contribute zero), and it's baked into the decode CUDA graph at
+    // construction (adaptive_splits re-captures on change). SPARKINFER_NSPLITS pins a fixed
+    // value for A/B sweeps without a rebuild. Clamp to [1, MAX_NSPLITS]; the partial buffers
+    // below are sized from MAX_NSPLITS.
     if (const char* ns = getenv("SPARKINFER_NSPLITS")) {
         int v = atoi(ns); if (v < 1) v = 1; if (v > Impl::MAX_NSPLITS) v = Impl::MAX_NSPLITS; p_->n_splits = v;
         p_->adaptive_splits = false;   // fixed n_splits (A/B/sweeps)
@@ -207,16 +214,33 @@ int Qwen35Model::forward_token(int token_id, int position) {
     s.h_scalars[3] = seqlen;
     cu(cudaMemcpyAsync(s.d_scalars, s.h_scalars, 4 * sizeof(int), cudaMemcpyHostToDevice, st), "decode scalars");
 
-    // Depth-adaptive KV-split: scale n_splits with seq_len so each split's SERIAL KV chunk stays
-    // bounded (~split_chunk). With a fixed n_splits the split kernel collapses at long context (at
-    // 32k each of 32 splits streams ~1024 KV serially on <=1024 blocks -> latency-bound, ~6x below
-    // roofline). Quantized to powers of two from 32, so the decode graph is re-captured only ~log2
-    // times over a generation. Off when SPARKINFER_NSPLITS pins a fixed value. Partials are sized for
-    // MAX_NSPLITS, and the online-softmax combine is exact for any split count (accuracy unchanged).
+    // Depth-adaptive KV-split. n_splits (a power of two in [32, MAX_NSPLITS], baked into the
+    // decode CUDA graph and re-captured only ~log2 times per generation) is set by two constraints:
+    //
+    //  (1) latency  — each split streams ~`serial` KV tokens; grow n_splits so that serial chunk
+    //                 stays bounded, else the split kernel collapses at long context (at 32k a fixed
+    //                 32 splits stream ~1024 KV each -> latency-bound, ~6x below roofline).
+    //  (2) occupancy — the GQA split kernel launches num_kv_heads*n_splits blocks. The device needs
+    //                 ~OCC_WAVES*num_sms of them in flight to hide the memory-bound KV read. The old
+    //                 fixed serial=256 satisfied (1) but pinned n_splits at the 32 floor across the
+    //                 whole 1k-8k band (4*32 = 128 blocks < a 5090's 170 SMs) -> a single under-filled
+    //                 wave and ~12% lost at 4k. Deriving the fill target from the real SM count closes
+    //                 that valley and generalizes across Blackwell parts (5090 .. GB10) instead of
+    //                 baking one card's numbers into a constant.
+    //
+    // Latency picks the split count; once context is non-trivial (want past the 32 floor, i.e. KV is
+    // large enough to dominate) the occupancy floor raises it to fill the SMs. The online-softmax
+    // combine is exact for any split count, so this is accuracy-neutral (empty splits contribute zero).
     if (s.adaptive_splits) {
-        int want = 32;                                  // preserve the short-context sweet spot
-        const int target_chunk = (seqlen > 8192 && s.split_chunk > 1) ? (s.split_chunk >> 1) : s.split_chunk;
-        while (want < Impl::MAX_NSPLITS && (long)want * target_chunk < seqlen) want <<= 1;
+        const int serial = (seqlen > 8192 && s.split_chunk > 1) ? (s.split_chunk >> 1) : s.split_chunk;
+        int want = 32;                                  // short-context sweet spot
+        while (want < Impl::MAX_NSPLITS && (long)want * serial < seqlen) want <<= 1;
+        if (want > 32 && s.num_sms > 0) {               // KV dominates -> also fill the GPU
+            const int target_blocks = Impl::OCC_WAVES * s.num_sms;
+            int fill = 32;
+            while (fill < Impl::MAX_NSPLITS && (long)fill * c.n_kv_heads < target_blocks) fill <<= 1;
+            if (fill > want) want = fill;
+        }
         if (want != s.n_splits) {                       // changed -> invalidate the captured graph
             s.n_splits = want;
             if (s.graph_ready) {
