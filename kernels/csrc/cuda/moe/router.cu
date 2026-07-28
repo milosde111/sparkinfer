@@ -18,6 +18,14 @@
 namespace sparkinfer {
 namespace kernels {
 
+// Upper bound on top_k for the generic routers. moe_router_kernel holds the
+// chosen logits/ids in fixed-size registers (sel_logit/sel_id); moe_router_kernel2
+// stages them in fixed shared arrays (s_sel_id/s_sel_logit). The launcher rejects
+// larger values instead of overrunning those arrays. Bitonic top-8 paths
+// (fused decode + prefill warp) are capped separately at MOE_ROUTER_BITONIC_TOPK.
+static constexpr int MOE_ROUTER_MAX_TOPK    = 16;
+static constexpr int MOE_ROUTER_BITONIC_TOPK = 8;
+
 // Warp arg-max: returns the max value across the warp; *idx is set on every lane
 // to the index that owns it (ties resolved to the lowest index).
 __device__ __forceinline__ float warp_argmax(float val, int& idx) {
@@ -46,8 +54,8 @@ __global__ void moe_router_kernel(
     for (int e = lane; e < num_experts; e += 32) s_logits[e] = row[e];
     __syncwarp();
 
-    float sel_logit[16];                   // top_k <= 16
-    int   sel_id[16];
+    float sel_logit[MOE_ROUTER_MAX_TOPK];  // top_k <= MOE_ROUTER_MAX_TOPK (launcher-enforced)
+    int   sel_id[MOE_ROUTER_MAX_TOPK];
 
     for (int j = 0; j < top_k; j++) {
         float best = -1e30f; int best_i = -1;
@@ -104,8 +112,8 @@ __global__ void moe_router_kernel2(
     const int e   = threadIdx.x;                 // one thread per expert
     if (tok >= num_tokens) return;
     extern __shared__ float s_logits[];          // [num_experts]
-    __shared__ int   s_sel_id[16];               // top_k <= 16
-    __shared__ float s_sel_logit[16];
+    __shared__ int   s_sel_id[MOE_ROUTER_MAX_TOPK];    // top_k <= MOE_ROUTER_MAX_TOPK (launcher-enforced)
+    __shared__ float s_sel_logit[MOE_ROUTER_MAX_TOPK];
     const float* rowp = logits + (size_t)tok * num_experts;
     if (e < num_experts) s_logits[e] = rowp[e];
     __syncthreads();
@@ -298,6 +306,10 @@ void launch_moe_router(
     int normalize, cudaStream_t stream
 ) {
     if (num_tokens <= 0 || num_experts <= 0 || top_k <= 0 || top_k > num_experts) return;
+    // sel_logit/sel_id and s_sel_id/s_sel_logit are sized to MOE_ROUTER_MAX_TOPK; without this
+    // guard, top_k > 16 (or SPARKINFER_ROUTER2=0 with top_k > 16) falls into moe_router_kernel
+    // and overruns those fixed arrays.
+    if (top_k > MOE_ROUTER_MAX_TOPK) return;
     size_t smem = (size_t)num_experts * sizeof(float);
     // Default ON: single-pass rank-select top-k (one thread/expert). SPARKINFER_ROUTER2=0
     // restores the k-pass single-warp kernel. Falls back automatically if num_experts > 1024.
@@ -308,13 +320,13 @@ void launch_moe_router(
     // staging assumes; decode (num_tokens==1) keeps its existing kernels.
     static int tw = -1;
     if (tw < 0) { const char* e = getenv("SPARKINFER_PREFILL_TOPK_WARP"); tw = (e && e[0] == '0') ? 0 : 1; }
-    if (tw && num_tokens >= 64 && num_experts == 256 && top_k <= 8) {
+    if (tw && num_tokens >= 64 && num_experts == 256 && top_k <= MOE_ROUTER_BITONIC_TOPK) {
         moe_router_topk_warp_kernel<<<(num_tokens + 7) / 8, 256, 0, stream>>>(
             logits, expert_ids, expert_weights, tokens_per_expert,
             num_tokens, top_k, normalize);
         return;
     }
-    if (r2 && top_k <= 16 && num_experts <= 1024) {
+    if (r2 && top_k <= MOE_ROUTER_MAX_TOPK && num_experts <= 1024) {
         const int bd = ((num_experts + 31) / 32) * 32;     // round up to a warp multiple
         moe_router_kernel2<<<num_tokens, bd, smem, stream>>>(
             logits, expert_ids, expert_weights, tokens_per_expert,
@@ -333,6 +345,10 @@ void launch_moe_router(
 void launch_router_fused(const void* x, const void* W, float* logits, unsigned int* gridctr,
                          int* expert_ids, float* expert_weights,
                          int num_experts, int K, int top_k, int normalize, cudaStream_t stream) {
+    // si_warp_bitonic_top8 keeps only 8 descending candidates in registers (r[8]/ri[8]);
+    // top_k > 8 would read past that list. num_experts==256 and K%8==0 are hard requirements
+    // of the fused GEMV + staging layout (see kernel comment above).
+    if (num_experts != 256 || (K & 7) || top_k <= 0 || top_k > MOE_ROUTER_BITONIC_TOPK) return;
     constexpr int SPL = 4, RPB = 8 / SPL;              // GEMV_WPB = 8, matches gemv_f32_sk<float,4>
     dim3 grid((num_experts + RPB - 1) / RPB);
     moe_router_fused_kernel<SPL><<<grid, 8 * 32, 0, stream>>>(
