@@ -2458,22 +2458,39 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
         }
         cu(cudaGraphLaunch(s.cu_dflash_exec, st), "dflash graph launch (first)");
     } else if (capturing_graph) {
-        cu(cudaStreamEndCapture(st, &s.cu_graph), "end capture");
-        cu(cudaGraphInstantiate(&s.cu_exec, s.cu_graph, 0), "graph instantiate");
-        s.graph_ready = true;
-        s.graph_attn_mode = attn_graph_mode;
-        s.graph_sparse = sparse_on;
-        static int graph_dbg = -1;
-        if (graph_dbg < 0) {
-            const char* e = getenv("SPARKINFER_GRAPH_DEBUG");
-            graph_dbg = (e && e[0] == '1') ? 1 : 0;
+        // Only mark the decode graph ready when both EndCapture and Instantiate succeed.
+        // A failed capture used to leave graph_ready=true with a null/empty exec; bench_decode's
+        // device loop then launched it n times in ~0.4 ms and reported 150k–340k tok/s (#1125).
+        const cudaError_t cap_e = cudaStreamEndCapture(st, &s.cu_graph);
+        if (cap_e != cudaSuccess) {
+            cu(cap_e, "end capture");
+            s.cu_graph = nullptr;
+            s.cu_exec = nullptr;
+            s.graph_ready = false;
+        } else {
+            const cudaError_t inst_e = cudaGraphInstantiate(&s.cu_exec, s.cu_graph, 0);
+            if (inst_e != cudaSuccess) {
+                cu(inst_e, "graph instantiate");
+                if (s.cu_graph) { cudaGraphDestroy(s.cu_graph); s.cu_graph = nullptr; }
+                s.cu_exec = nullptr;
+                s.graph_ready = false;
+            } else {
+                s.graph_ready = true;
+                s.graph_attn_mode = attn_graph_mode;
+                s.graph_sparse = sparse_on;
+                static int graph_dbg = -1;
+                if (graph_dbg < 0) {
+                    const char* e = getenv("SPARKINFER_GRAPH_DEBUG");
+                    graph_dbg = (e && e[0] == '1') ? 1 : 0;
+                }
+                if (graph_dbg) {
+                    const int mma_chunk = (s.n_splits > 0) ? (seqlen + s.n_splits - 1) / s.n_splits : 0;
+                    fprintf(stderr, "[graph] capture pos=%d seqlen=%d n_splits=%d attn_mode=%d mma_chunk=%d sparse=%d\n",
+                            position, seqlen, s.n_splits, attn_graph_mode, mma_chunk, sparse_on ? 1 : 0);
+                }
+                cu(cudaGraphLaunch(s.cu_exec, st), "graph launch (first)");
+            }
         }
-        if (graph_dbg) {
-            const int mma_chunk = (s.n_splits > 0) ? (seqlen + s.n_splits - 1) / s.n_splits : 0;
-            fprintf(stderr, "[graph] capture pos=%d seqlen=%d n_splits=%d attn_mode=%d mma_chunk=%d sparse=%d\n",
-                    position, seqlen, s.n_splits, attn_graph_mode, mma_chunk, sparse_on ? 1 : 0);
-        }
-        cu(cudaGraphLaunch(s.cu_exec, st), "graph launch (first)");
     }
 
     cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "out_id");
@@ -2787,10 +2804,10 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
         tok = forward_token(tok, pos++, true);
         if (tok < 0 || tok >= s.cfg.vocab) tok = 100;
     }
-    if (s.graph_ready) cu(cudaGraphUpload(s.cu_exec, s.stream), "bench graph upload");
+    if (s.graph_ready && s.cu_exec) cu(cudaGraphUpload(s.cu_exec, s.stream), "bench graph upload");
     cudaDeviceSynchronize();
 
-    if (bench_device_loop && s.graph_ready) {
+    if (bench_device_loop && s.graph_ready && s.cu_exec) {
         s.h_scalars[0] = tok;
         s.h_scalars[1] = pos;
         s.h_scalars[2] = pos;
@@ -6327,10 +6344,10 @@ bool Qwen35Model::load_gguf(const std::string& path) {
         (void)fp4_free; (void)fp4_total;
         // The packed continuous-batch decode reads the o and down copies too, and cb serving loads
         // at the 4096 default; the preflight below still drops them whenever the set does not fit.
-        // SPARKINFER_MUSE_NVFP4_OUTPUTS_MAXSEQ=4096 restores the old bound.
+        // SPARKINFER_MUSE_NVFP4_OUTPUTS_MAXSEQ=2048 restores the old bound.
         static const int outputs_maxseq = [] {
             const char* e = getenv("SPARKINFER_MUSE_NVFP4_OUTPUTS_MAXSEQ");
-            return e ? atoi(e) : 8192;
+            return e ? atoi(e) : 4096;
         }();
         bool down_fp4_on = c.max_seq <= outputs_maxseq;
         if (fp4o_env)

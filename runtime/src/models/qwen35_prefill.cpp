@@ -487,8 +487,34 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         if (cudaMallocHost(&g_pfb_pin, (size_t)N * sizeof(int)) == cudaSuccess) g_pfb_pin_cap = N;
     }
     const bool graph_ok = graph_on && g_pfb_pin && g_pfb_pin_cap >= N;
+    // Streamed Q4_K→NVFP4 o-proj / down builds the operand in per-pass cudaMalloc scratch
+    // (dn_scratch, wo_st) that is freed when the call returns. A whole-prefill graph would bake
+    // those addresses and then replay them dangling. At N=512 the arena is small enough to keep
+    // the graph resident, which is how #1125 reported 150k–340k AR decode tok/s after the first
+    // streamed 512-token prefill (eval-museglimmer:REJECT). Never capture or replay that N.
+    static const int pfb_wo_min = [] {
+        const char* e = getenv("SPARKINFER_MUSE_NVFP4_WO_MINN"); return e ? atoi(e) : 512;
+    }();
+    static const int pfb_dn_min = [] {
+        const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN_MINN"); return e ? atoi(e) : 512;
+    }();
+    static const bool pfb_wo_stream = [] {
+        const char* e = getenv("SPARKINFER_MUSE_NVFP4_WO_STREAM"); return !(e && e[0] == '0');
+    }();
+    static const bool pfb_dn_stream = [] {
+        const char* e = getenv("SPARKINFER_MUSE_NVFP4_DOWN_STREAM"); return !(e && e[0] == '0');
+    }();
+    const bool pfb_nvfp4_stream = c.muse_glimmer && !s.w.layers.empty() &&
+        ((pfb_wo_stream && N >= pfb_wo_min && !s.w.layers[0].wo_fp4 && s.w.layers[0].wo) ||
+         (pfb_dn_stream && N >= pfb_dn_min && !s.w.layers[0].down_fp4));
+    if (pfb_nvfp4_stream && g_pfb_exec) {
+        cudaGraphExecDestroy(g_pfb_exec); g_pfb_exec = nullptr;
+        if (g_pfb_graph) { cudaGraphDestroy(g_pfb_graph); g_pfb_graph = nullptr; }
+        g_pfb_n = -1;
+        g_pfb_warm_n = -1;
+    }
     if (graph_ok) memcpy(g_pfb_pin, prompt_ids, (size_t)N * sizeof(int));
-    if (graph_ok && g_pfb_exec && g_pfb_n == N) {
+    if (graph_ok && g_pfb_exec && g_pfb_n == N && !pfb_nvfp4_stream) {
         pf_cu(cudaGraphLaunch(g_pfb_exec, st), "pfb graph launch");
         pf_cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st),
               "pfb graph seed");
@@ -1538,7 +1564,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         if (g_pfb_graph) { cudaGraphDestroy(g_pfb_graph); g_pfb_graph = nullptr; }
         g_pfb_n = -1;
     }
-    if (graph_ok && !g_pfb_exec && g_pfb_warm_n == N && !g_pfb_redo) {
+    if (graph_ok && !g_pfb_exec && g_pfb_warm_n == N && !g_pfb_redo && !pfb_nvfp4_stream) {
         if (cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal) == cudaSuccess)
             pfb_capturing = true;
     }
